@@ -26,6 +26,7 @@ function owi_create_log_folder() {
 // Подключение файлов настроек и импорта
 require_once OWI_PLUGIN_DIR . 'includes/settings.php';
 require_once OWI_PLUGIN_DIR . 'includes/import.php';
+require_once OWI_PLUGIN_DIR . 'includes/update-products.php';
 require_once OWI_PLUGIN_DIR . 'includes/update-categories-images.php'; // Подключение нового файла
 require_once OWI_PLUGIN_DIR . 'includes/ui-frontend.php';
 require_once OWI_PLUGIN_DIR . 'includes/schedule.php'; // Подключение файла расписания
@@ -116,6 +117,17 @@ function owi_log($message) {
         mkdir($log_dir, 0755, true);
     }
     $log_file = OWI_LOG_FILE;
+
+    // Basic rotation to avoid multi-hundred-MB log files.
+    if (file_exists($log_file)) {
+        $max_size = 5 * 1024 * 1024; // 5MB
+        $size = @filesize($log_file);
+        if ($size !== false && $size > $max_size) {
+            $rotated = OWI_PLUGIN_DIR . 'logs/import-' . date('Ymd-His') . '.log';
+            @rename($log_file, $rotated);
+        }
+    }
+
     $date = date('Y-m-d H:i:s');
     file_put_contents($log_file, "[$date] $message" . PHP_EOL, FILE_APPEND);
 }

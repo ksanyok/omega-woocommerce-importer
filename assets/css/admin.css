@@ -63,3 +63,34 @@
     margin-right: 10px;
     margin-top: 5px;
 }
+
+/* Schedule page: separate progress bars */
+#owi-import-progress-bar,
+#owi-update-progress-bar {
+    width: 100%;
+    background-color: #e9ecef;
+    border-radius: 5px;
+    overflow: hidden;
+}
+
+#owi-import-progress-status,
+#owi-update-progress-status {
+    width: 100%;
+    background-color: #e9ecef;
+}
+
+#owi-import-progress,
+#owi-update-progress {
+    width: 0%;
+    height: 20px;
+    transition: width 0.5s ease;
+}
+
+#owi-import-progress-info,
+#owi-update-progress-info {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    gap: 8px;
+    font-size: 14px;
+}
