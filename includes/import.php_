@@ -1,0 +1,702 @@
+<?php
+// Ensure this file is not accessed directly
+if (!defined('ABSPATH')) {
+    exit; // Exit if accessed directly
+}
+
+// Function to display the import page
+function owi_import_page() {
+    ?>
+    <div class="wrap">
+        <h1>Импорт товаров из Omega</h1>
+        <button id="owi-start-import" class="button button-primary">Начать импорт заново</button>
+        <button id="owi-resume-import" class="button button-primary" style="margin-left:10px;">Продолжить незавершённый импорт</button>
+        <button id="owi-pause-import" class="button button-secondary" style="margin-left:10px;" disabled>Пауза</button>
+        <button id="owi-stop-import" class="button button-secondary" style="margin-left:10px;" disabled>Остановить импорт</button>
+        <button id="owi-reset-import" class="button button-secondary" style="margin-left:10px;">Сбросить флаги</button>
+        <div id="owi-import-result">
+            <div id="owi-progress-bar" style="display:none; margin-top:20px;">
+                <div id="owi-progress-status">
+                    <div id="owi-progress" style="width: 0%; height: 20px; background-color: #28a745;"></div>
+                </div>
+                <div id="owi-progress-info" style="margin-top:10px;">
+                    <span id="owi-progress-percentage">0%</span> | 
+                    <span id="owi-progress-time">Время: 0 сек</span> | 
+                    <span id="owi-progress-remaining">Осталось: -</span> | 
+                    <span id="owi-progress-speed">Скорость: 0 товаров/мин</span> | 
+                    <span id="owi-progress-imported">Импортировано: 0</span> | 
+                    <span id="owi-progress-skipped">Пропущено: 0</span>
+                </div>
+            </div>
+        </div>
+    </div>
+    <?php
+}
+
+// Register the import page in the admin menu
+function owi_add_import_page() {
+    add_menu_page(
+        'OWI Импорт',
+        'OWI Импорт',
+        'manage_options',
+        'owi-import',
+        'owi_import_page',
+        'dashicons-upload',
+        60
+    );
+}
+add_action('admin_menu', 'owi_add_import_page');
+
+// Enqueue the JavaScript and localize script with AJAX URL and nonce
+function owi_enqueue_scripts($hook) {
+    if ($hook !== 'toplevel_page_owi-import') {
+        return;
+    }
+
+    wp_enqueue_script('owi-import-script', plugin_dir_url(__FILE__) . 'js/owi-import.js', array('jquery'), '1.0', true);
+
+    wp_localize_script('owi-import-script', 'owi_ajax_object', array(
+        'ajax_url' => admin_url('admin-ajax.php'),
+        'nonce'    => wp_create_nonce('owi_import_nonce')
+    ));
+}
+add_action('admin_enqueue_scripts', 'owi_enqueue_scripts');
+
+// AJAX handler to initiate import (start from scratch)
+add_action('wp_ajax_owi_start_import', 'owi_start_import_callback');
+
+function owi_start_import_callback() {
+    // Security nonce check
+    check_ajax_referer('owi_import_nonce', 'nonce');
+
+    // User capability check
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error('У вас нет прав для выполнения этого действия.');
+    }
+
+    // Call the main import function (fresh start)
+    $result = owi_run_import(true);
+
+    if ($result['success']) {
+        wp_send_json_success('Импорт начат.');
+    } else {
+        wp_send_json_error($result['message']);
+    }
+}
+
+// AJAX handler to resume import
+add_action('wp_ajax_owi_resume_import', 'owi_resume_import_callback');
+
+function owi_resume_import_callback() {
+    check_ajax_referer('owi_import_nonce', 'nonce');
+
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error('У вас нет прав для выполнения этого действия.');
+    }
+
+    $result = owi_run_import(false);
+
+    if ($result['success']) {
+        wp_send_json_success('Импорт возобновлён.');
+    } else {
+        wp_send_json_error($result['message']);
+    }
+}
+
+/**
+ * Main import function that initializes or resumes the import process.
+ *
+ * @param bool $fresh_start Если true, начать импорт заново, иначе попытаться продолжить.
+ * @return array Result of the import initiation or continuation.
+ */
+function owi_run_import($fresh_start = false) {
+    // If fresh start, reset progress and flags
+    if ($fresh_start) {
+        update_option('owi_import_in_progress', false);
+        delete_option('owi_import_stop');
+        delete_option('owi_import_pause');
+        delete_option('owi_import_progress');
+    }
+
+    // Check if import is already in progress
+    if (get_option('owi_import_in_progress') && !$fresh_start) {
+        // Проверим паузу или остановку
+        if (get_option('owi_import_pause')) {
+            // Снимаем паузу и продолжаем
+            delete_option('owi_import_pause');
+            // Возобновляем с текущей страницы
+            $progress = get_option('owi_import_progress');
+            if (!$progress) {
+                return array('success' => false, 'message' => 'Невозможно возобновить: нет сохраненного прогресса.');
+            }
+            $page_to_resume = $progress['current_page'];
+            $api_key = get_option('owi_api_key');
+            $api_url = 'https://public.omega.page/public/api/v1.0/product/pricelist/paged';
+            // Продолжаем с текущей страницы
+            wp_schedule_single_event(time(), 'owi_process_next_import_page', array($page_to_resume, $api_url, $api_key));
+            return array('success' => true, 'message' => 'Импорт возобновлён с паузы.');
+        }
+        
+        // Если уже в прогрессе и не на паузе - значит импорт идет
+        return array('success' => false, 'message' => 'Импорт уже запущен.');
+    }
+
+    // Если попытка возобновления, но прогресс не существует или импорт не был в прогрессе
+    if (!$fresh_start) {
+        $progress = get_option('owi_import_progress');
+        if (empty($progress) || get_option('owi_import_in_progress') == false) {
+            return array('success' => false, 'message' => 'Нет незавершенного импорта для продолжения.');
+        }
+
+        // Проверяем, не достигнут ли уже конец
+        if ($progress['current_page'] >= $progress['total_pages']) {
+            return array('success' => false, 'message' => 'Импорт уже завершен, нечего продолжать.');
+        }
+
+        // Снимаем флаги стопа и паузы
+        delete_option('owi_import_stop');
+        delete_option('owi_import_pause');
+
+        // Возобновляем импорт с текущей страницы
+        update_option('owi_import_in_progress', true);
+        $api_key = get_option('owi_api_key');
+        $api_url = 'https://public.omega.page/public/api/v1.0/product/pricelist/paged';
+        $current_page = $progress['current_page'];
+
+        wp_schedule_single_event(time(), 'owi_process_next_import_page', array($current_page, $api_url, $api_key));
+        return array('success' => true, 'message' => 'Импорт возобновлён.');
+    }
+
+    // If fresh_start - start anew
+    // Check if an import is already in progress to prevent multiple starts
+    if (get_option('owi_import_in_progress')) {
+        return array('success' => false, 'message' => 'Импорт уже запущен.');
+    }
+
+    // Set import flag
+    update_option('owi_import_in_progress', true);
+
+    // Initialize progress
+    $per_page = 100; // Number of products per request
+    $start_time = time();
+
+    $progress_data = array(
+        'per_page' => $per_page,
+        'total_pages' => 0,
+        'current_page' => 0,
+        'imported_count' => 0,
+        'skipped_count' => 0,
+        'start_time' => $start_time,
+        'last_update_time' => $start_time,
+        'requests_made' => 0
+    );
+
+    update_option('owi_import_progress', $progress_data);
+
+    // Get API key
+    $api_key = get_option('owi_api_key');
+    if (empty($api_key)) {
+        update_option('owi_import_in_progress', false);
+        return array('success' => false, 'message' => 'API ключ не установлен.');
+    }
+
+    // API settings
+    $api_url = 'https://public.omega.page/public/api/v1.0/product/pricelist/paged';
+    $page = 0;
+
+    owi_log('Импорт начат.');
+
+    // Get total number of products
+    $initial_data = array(
+        'IsPrepay' => false,
+        'From' => 0,
+        'Count' => 1,
+        'AddSupplierRests' => false,
+        'Key' => $api_key
+    );
+
+    $initial_response = wp_remote_post($api_url, array(
+        'headers' => array('Content-Type' => 'application/json', 'Accept' => 'application/json'),
+        'body' => json_encode($initial_data),
+        'timeout' => 60
+    ));
+
+    if (is_wp_error($initial_response)) {
+        owi_log('Ошибка при подключении к API: ' . $initial_response->get_error_message());
+        update_option('owi_import_in_progress', false);
+        return array('success' => false, 'message' => 'Ошибка при подключении к API: ' . $initial_response->get_error_message());
+    }
+
+    $initial_body = wp_remote_retrieve_body($initial_response);
+    $initial_result = json_decode($initial_body, true);
+
+    if (!isset($initial_result['Status']) || $initial_result['Status'] != 0) {
+        owi_log('Ошибка API: Статус ' . (isset($initial_result['Status']) ? $initial_result['Status'] : 'нет статуса'));
+        update_option('owi_import_in_progress', false);
+        return array('success' => false, 'message' => 'Ошибка API: Статус ' . (isset($initial_result['Status']) ? $initial_result['Status'] : 'нет статуса'));
+    }
+
+    $total_products = isset($initial_result['Total']) ? intval($initial_result['Total']) : 0;
+    owi_log("Общее количество товаров: $total_products");
+
+    if ($total_products == 0) {
+        owi_log('Нет товаров для импорта.');
+        update_option('owi_import_in_progress', false);
+        return array('success' => false, 'message' => 'Нет товаров для импорта.');
+    }
+
+    $total_pages = ceil($total_products / $per_page);
+    owi_log("Общее количество страниц: $total_pages");
+
+    $progress_data['total_pages'] = $total_pages;
+    update_option('owi_import_progress', $progress_data);
+
+    wp_schedule_single_event(time(), 'owi_process_next_import_page', array($page, $api_url, $api_key));
+
+    return array('success' => true);
+}
+
+// Function to process individual import page
+function owi_process_import_page_cron($page, $api_url, $api_key) {
+    // Check stop flag
+    if (get_option('owi_import_stop')) {
+        owi_log('Импорт остановлен пользователем.');
+        update_option('owi_import_in_progress', false);
+        delete_option('owi_import_stop');
+        return;
+    }
+
+    // Check pause flag
+    if (get_option('owi_import_pause')) {
+        owi_log('Импорт поставлен на паузу.');
+        update_option('owi_import_in_progress', false);
+        return;
+    }
+
+    // Get current progress
+    $progress = get_option('owi_import_progress');
+    if (!$progress) {
+        owi_log('Нет данных о прогрессе импорта.');
+        update_option('owi_import_in_progress', false);
+        return;
+    }
+
+    $per_page = $progress['per_page'];
+    $total_pages = $progress['total_pages'];
+    $current_page = $progress['current_page'];
+    $imported_count = $progress['imported_count'];
+    $skipped_count = $progress['skipped_count'];
+    $start_time = $progress['start_time'];
+    $last_update_time = $progress['last_update_time'];
+    $requests_made = $progress['requests_made'] ?? 0;
+
+    // Prepare data for request
+    $data = array(
+        'IsPrepay' => false,
+        'From' => $page,
+        'Count' => $per_page,
+        'AddSupplierRests' => false,
+        'Key' => $api_key
+    );
+
+    $response = wp_remote_post($api_url, array(
+        'headers' => array('Content-Type' => 'application/json', 'Accept' => 'application/json'),
+        'body' => json_encode($data),
+        'timeout' => 60
+    ));
+
+    $requests_made++;
+    $progress['requests_made'] = $requests_made;
+
+    if (is_wp_error($response)) {
+        owi_log('Ошибка при подключении к API: ' . $response->get_error_message());
+        update_option('owi_import_in_progress', false);
+        return;
+    }
+
+    $body = wp_remote_retrieve_body($response);
+    $result = json_decode($body, true);
+
+    if (!isset($result['Status']) || $result['Status'] != 0) {
+        owi_log('Ошибка API: Статус ' . (isset($result['Status']) ? $result['Status'] : 'нет статуса'));
+        update_option('owi_import_in_progress', false);
+        return;
+    }
+
+    if (empty($result['Result'])) {
+        owi_log('Нет больше товаров для импорта.');
+        update_option('owi_import_in_progress', false);
+        return;
+    }
+
+    // Process products
+    foreach ($result['Result'] as $product_data) {
+        // Filter by stock availability
+        $in_stock = false;
+        if (!empty($product_data['Rests'])) {
+            foreach ($product_data['Rests'] as $rest) {
+                if (isset($rest['Value']) && intval($rest['Value']) > 0) {
+                    $in_stock = true;
+                    break;
+                }
+            }
+        }
+
+        if (!$in_stock) {
+            $skipped_count++;
+            continue; // Skip product if not in stock
+        }
+
+        $saved = owi_save_product($product_data);
+        if ($saved) {
+            $imported_count++;
+        } else {
+            $skipped_count++;
+        }
+    }
+
+    // Update progress
+    $current_page++;
+    $progress['current_page'] = $current_page;
+    $progress['imported_count'] = $imported_count;
+    $progress['skipped_count'] = $skipped_count;
+    $progress['last_update_time'] = time();
+    $progress['requests_made'] = 0; // Reset request counter
+
+    update_option('owi_import_progress', $progress);
+    owi_log("Страница $current_page обработана. Импортировано товаров: $imported_count, пропущено: $skipped_count");
+
+    // Если достигли конца
+    if ($current_page >= $total_pages) {
+        owi_log("Импорт завершен. Всего импортировано товаров: $imported_count, пропущено: $skipped_count");
+        update_option('owi_import_in_progress', false);
+        return;
+    }
+
+    // Если не достигли конца, планируем следующую страницу с задержкой
+    $rate_limit_per_minute = 30;
+    $elapsed = time() - $start_time;
+
+    // Добавим задержку 10 секунд между запросами для снижения нагрузки
+    $delay = 10;
+    
+    if ($elapsed < 60 && $requests_made >= $rate_limit_per_minute) {
+        $sleep_time = 60 - $elapsed;
+        owi_log("Достигнут лимит запросов. Пауза на $sleep_time секунд.");
+        wp_schedule_single_event(time() + $sleep_time, 'owi_process_next_import_page', array($current_page, $api_url, $api_key));
+    } else {
+        wp_schedule_single_event(time() + $delay, 'owi_process_next_import_page', array($current_page, $api_url, $api_key));
+    }
+}
+
+// Hook to process the next import page
+add_action('owi_process_next_import_page', 'owi_process_import_page_cron', 10, 3);
+
+// AJAX handler to stop import
+add_action('wp_ajax_owi_stop_import', 'owi_stop_import_callback');
+
+function owi_stop_import_callback() {
+    check_ajax_referer('owi_import_nonce', 'nonce');
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error('У вас нет прав для выполнения этого действия.');
+    }
+    update_option('owi_import_stop', true);
+    wp_send_json_success('Флаг остановки установлен. Импорт будет остановлен в ближайший момент.');
+}
+
+// AJAX handler to pause import
+add_action('wp_ajax_owi_pause_import', 'owi_pause_import_callback');
+
+function owi_pause_import_callback() {
+    check_ajax_referer('owi_import_nonce', 'nonce');
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error('У вас нет прав для выполнения этого действия.');
+    }
+    update_option('owi_import_pause', true);
+    wp_send_json_success('Импорт будет поставлен на паузу в ближайший момент.');
+}
+
+// AJAX handler to reset import flags
+add_action('wp_ajax_owi_reset_import', 'owi_reset_import_callback');
+
+function owi_reset_import_callback() {
+    check_ajax_referer('owi_import_nonce', 'nonce');
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error('У вас нет прав для выполнения этого действия.');
+    }
+
+    // Reset all flags and progress
+    delete_option('owi_import_in_progress');
+    delete_option('owi_import_stop');
+    delete_option('owi_import_pause');
+    delete_option('owi_import_progress');
+
+    wp_send_json_success('Все флаги и прогресс сброшены.');
+}
+
+// Handler to get import progress
+add_action('wp_ajax_owi_get_import_progress', 'owi_get_import_progress_callback');
+
+function owi_get_import_progress_callback() {
+    check_ajax_referer('owi_import_nonce', 'nonce');
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error('У вас нет прав для выполнения этого действия.');
+    }
+
+    $progress = get_option('owi_import_progress');
+
+    if (!$progress) {
+        wp_send_json_error('Нет данных о прогрессе импорта.');
+    }
+
+    $per_page = $progress['per_page'] ?? 100;
+    $total_pages = $progress['total_pages'];
+    $current_page = $progress['current_page'];
+    $imported_count = $progress['imported_count'];
+    $skipped_count = $progress['skipped_count'];
+    $start_time = $progress['start_time'];
+    $last_update_time = $progress['last_update_time'];
+
+    $elapsed_time = $last_update_time - $start_time; // In seconds
+    $elapsed_minutes = $elapsed_time / 60;
+    $total_processed = $imported_count + $skipped_count; // Total processed products
+    $speed = ($elapsed_minutes > 0) ? round($total_processed / $elapsed_minutes) : 0; // products per minute
+
+    $remaining_pages = $total_pages - $current_page;
+    $estimated_remaining_time = ($speed > 0) ? round((($remaining_pages * $per_page) / $speed) / 60) : -1; // In minutes
+
+    $percentage = ($total_pages > 0) ? round(($current_page / $total_pages) * 100) : 0;
+
+    wp_send_json_success(array(
+        'percentage' => $percentage,
+        'imported_count' => $imported_count,
+        'skipped_count' => $skipped_count,
+        'elapsed_time' => $elapsed_time,
+        'estimated_remaining_time' => $estimated_remaining_time,
+        'speed' => $speed
+    ));
+}
+
+// Function to save product to WooCommerce
+function owi_save_product($product_data) {
+    // Check if SKU (Number) exists
+    $sku = isset($product_data['Number']) ? sanitize_text_field($product_data['Number']) : '';
+    if (empty($sku)) {
+        owi_log('Отсутствует SKU для продукта: ' . print_r($product_data, true));
+        return false;
+    }
+
+    $existing_product_id = wc_get_product_id_by_sku($sku);
+
+    if ($existing_product_id) {
+        // Update existing product
+        $product = wc_get_product($existing_product_id);
+        if (!$product) {
+            owi_log("Товар с SKU $sku не найден. Создание нового.");
+            $product = new WC_Product();
+            $product->set_sku($sku);
+        }
+
+        $product->set_regular_price(isset($product_data['Price']) ? floatval($product_data['Price']) : 0);
+
+        // Set stock quantity from Rests
+        $stock_quantity = 0;
+        if (!empty($product_data['Rests'])) {
+            foreach ($product_data['Rests'] as $rest) {
+                if (isset($rest['Value']) && is_numeric($rest['Value'])) {
+                    $stock_quantity += intval($rest['Value']);
+                }
+            }
+        }
+        $product->set_stock_quantity($stock_quantity);
+        $product->set_manage_stock(true);
+        $product->set_stock_status($stock_quantity > 0 ? 'instock' : 'outofstock');
+
+        // Update meta data
+        $product->update_meta_data('_code_twhed_id', isset($product_data['CodeTWHED']) ? sanitize_text_field($product_data['CodeTWHED']) : '');
+        $product->update_meta_data('_card', isset($product_data['Card']) ? sanitize_text_field($product_data['Card']) : '');
+
+        // Set 'Brand' attribute
+        owi_set_product_brand_attribute($product, isset($product_data['BrandDescription']) ? sanitize_text_field($product_data['BrandDescription']) : '');
+
+        // Save the product
+        $product_id = $product->save();
+        return ($product_id !== false);
+    } else {
+        // Create new product
+        $product = new WC_Product();
+
+        // Set product data
+        $product->set_name(trim(isset($product_data['DescriptionUkr']) ? $product_data['DescriptionUkr'] : 'Без названия'));
+        $product->set_regular_price(isset($product_data['Price']) ? floatval($product_data['Price']) : 0);
+        $product->set_description(trim(isset($product_data['DescriptionUkr']) ? $product_data['DescriptionUkr'] : ''));
+        $product->set_short_description(trim(isset($product_data['DescriptionUkr']) ? $product_data['DescriptionUkr'] : ''));
+        $product->set_weight(isset($product_data['Weight']) ? floatval($product_data['Weight']) : 0);
+
+        // Set SKU
+        $product->set_sku($sku);
+
+        // Set stock quantity from Rests
+        $stock_quantity = 0;
+        if (!empty($product_data['Rests'])) {
+            foreach ($product_data['Rests'] as $rest) {
+                if (isset($rest['Value']) && is_numeric($rest['Value'])) {
+                    $stock_quantity += intval($rest['Value']);
+                }
+            }
+        }
+        $product->set_stock_quantity($stock_quantity);
+        $product->set_manage_stock(true);
+        $product->set_stock_status($stock_quantity > 0 ? 'instock' : 'outofstock');
+
+        // Save product to get ID
+        $product_id = $product->save();
+
+        // Update meta data
+        update_post_meta($product_id, '_code_twhed_id', isset($product_data['CodeTWHED']) ? sanitize_text_field($product_data['CodeTWHED']) : '');
+        update_post_meta($product_id, '_card', isset($product_data['Card']) ? sanitize_text_field($product_data['Card']) : '');
+
+        // Set 'Brand' attribute
+        owi_set_product_brand_attribute($product, isset($product_data['BrandDescription']) ? sanitize_text_field($product_data['BrandDescription']) : '');
+
+        // Save the product again after updating attributes
+        $product->save();
+
+        return ($product_id !== false);
+    }
+}
+
+// Function to set the 'Brand' attribute
+function owi_set_product_brand_attribute($product, $brand_description) {
+    if (empty($brand_description)) {
+        return;
+    }
+
+    // Удаление префикса "1." если он есть
+    $brand_name = preg_replace('/^1\./', '', trim($brand_description));
+    $brand_name = trim($brand_name);
+
+    // Санитизация имени бренда
+    $brand_name = wp_strip_all_tags($brand_name);
+    $brand_name = sanitize_text_field($brand_name);
+
+    if (empty($brand_name)) {
+        owi_log('Бренд имеет пустое или некорректное имя после санитизации: ' . $brand_description);
+        return;
+    }
+
+    $attribute_name = 'Brand';
+    $attribute_slug = 'pa_brand';
+
+    // Проверяем, существует ли атрибут
+    $attribute_id = wc_attribute_taxonomy_id_by_name($attribute_name);
+
+    if (!$attribute_id) {
+        // Создаем атрибут
+        $attribute_id = wc_create_attribute(array(
+            'name' => $attribute_name,
+            'slug' => sanitize_title($attribute_name),
+            'type' => 'select',
+            'order_by' => 'menu_order',
+            'has_archives' => true,
+        ));
+        if (is_wp_error($attribute_id)) {
+            owi_log('Ошибка при создании атрибута "Brand": ' . $attribute_id->get_error_message());
+            return;
+        }
+        // Регистрация таксономии
+        register_taxonomy($attribute_slug, array('product'), array(
+            'hierarchical' => false,
+            'labels' => array(
+                'name' => $attribute_name,
+                'singular_name' => $attribute_name,
+            ),
+            'show_ui' => false,
+            'query_var' => true,
+            'rewrite' => array('slug' => sanitize_title($attribute_name)),
+            'has_archives' => true,
+        ));
+    }
+
+    // Добавляем термин бренда
+    $brand_slug = sanitize_title($brand_name);
+
+    // Проверяем, существует ли термин
+    $term = get_term_by('slug', $brand_slug, $attribute_slug);
+
+    if (!$term) {
+        // Создаем термин
+        $term = wp_insert_term($brand_name, $attribute_slug, array('slug' => $brand_slug));
+        if (is_wp_error($term)) {
+            owi_log('Ошибка при создании термина бренда: ' . $term->get_error_message());
+            return;
+        }
+        $term_id = $term['term_id'];
+    } else {
+        $term_id = $term->term_id;
+    }
+
+    // Устанавливаем атрибут для продукта
+    $attributes = $product->get_attributes();
+
+    $product_attribute = new WC_Product_Attribute();
+    $product_attribute->set_id($attribute_id);
+    $product_attribute->set_name($attribute_slug);
+    $product_attribute->set_options(array($term_id));
+    $product_attribute->set_position(0);
+    $product_attribute->set_visible(true);
+    $product_attribute->set_variation(false);
+
+    $attributes[$attribute_slug] = $product_attribute;
+
+    $product->set_attributes($attributes);
+}
+
+// Add 'Card' field to the product edit page
+add_action('woocommerce_product_options_sku', 'owi_add_card_field');
+
+function owi_add_card_field() {
+    woocommerce_wp_text_input( array(
+        'id' => '_card',
+        'label' => __('Card', 'woocommerce'),
+        'description' => __('Значение Card из Omega API.', 'woocommerce'),
+        'desc_tip' => true,
+    ));
+}
+
+// Save 'Card' field
+add_action('woocommerce_process_product_meta', 'owi_save_card_field');
+
+function owi_save_card_field($post_id) {
+    $card = isset($_POST['_card']) ? sanitize_text_field($_POST['_card']) : '';
+    update_post_meta($post_id, '_card', $card);
+}
+
+// Ensure '_code_twhed_id' field is saved and displayed
+add_action('woocommerce_product_options_sku', 'owi_add_code_twhed_id_field');
+
+function owi_add_code_twhed_id_field() {
+    woocommerce_wp_text_input( array(
+        'id' => '_code_twhed_id',
+        'label' => __('CodeTWHED', 'woocommerce'),
+        'description' => __('Введите штрихкод или любой другой уникальный идентификатор товара.', 'woocommerce'),
+        'desc_tip' => true,
+    ));
+}
+
+// Save '_code_twhed_id' field
+add_action('woocommerce_process_product_meta', 'owi_save_code_twhed_id_field');
+
+function owi_save_code_twhed_id_field($post_id) {
+    $global_unique_id = isset($_POST['_code_twhed_id']) ? sanitize_text_field($_POST['_code_twhed_id']) : '';
+    update_post_meta($post_id, '_code_twhed_id', $global_unique_id);
+}
+
+// Utility function for logging
+if (!function_exists('owi_log')) {
+    function owi_log($message) {
+        if (WP_DEBUG === true) {
+            error_log('[OWI Import] ' . $message);
+        }
+    }
+}

@@ -1,0 +1,65 @@
+/* Пример стилей для административных страниц */
+#owi-import-result {
+    margin-top: 20px;
+}
+
+#owi-import-result .notice {
+    padding: 15px;
+    border-left: 4px solid;
+    margin-bottom: 10px;
+}
+
+#owi-import-result .notice-success {
+    background-color: #d4edda;
+    border-color: #28a745;
+    color: #155724;
+}
+
+#owi-import-result .notice-error {
+    background-color: #f8d7da;
+    border-color: #dc3545;
+    color: #721c24;
+}
+
+#owi-import-result .notice-info {
+    background-color: #d1ecf1;
+    border-color: #17a2b8;
+    color: #0c5460;
+}
+
+#owi-import-result .notice-warning {
+    background-color: #fff3cd;
+    border-color: #ffc107;
+    color: #856404;
+}
+
+#owi-progress-bar {
+    width: 100%;
+    background-color: #e9ecef;
+    border-radius: 5px;
+    overflow: hidden;
+}
+
+#owi-progress-status {
+    width: 100%;
+    background-color: #e9ecef;
+}
+
+#owi-progress {
+    width: 0%;
+    height: 20px;
+    background-color: #28a745;
+    transition: width 0.5s ease;
+}
+
+#owi-progress-info {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    font-size: 14px;
+}
+
+#owi-progress-info span {
+    margin-right: 10px;
+    margin-top: 5px;
+}
